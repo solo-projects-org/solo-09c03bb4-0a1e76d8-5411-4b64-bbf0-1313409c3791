@@ -31,6 +31,21 @@ CREATE TABLE IF NOT EXISTS event_log (
     ts  TEXT NOT NULL,
     msg TEXT NOT NULL
 );
+
+-- 更正回执的镜像：与源库 corrections 表同构（另加本地落库时间）。
+-- 回执与对应的震例更正在同一源事务提交，因此在镜像端同笔落库；
+-- 网页仅凭本表是否存在该请求号的回执判定“已采回”，不以震级相等或 WAL 位置推断。
+CREATE TABLE IF NOT EXISTS corrections (
+    request_id    TEXT PRIMARY KEY,   -- 更正请求号（幂等键）
+    event_id      TEXT NOT NULL,
+    new_magnitude REAL NOT NULL,
+    expected      TEXT NOT NULL,      -- JSON：提交时所见五字段
+    outcome       TEXT NOT NULL,      -- applied / rejected_mismatch / rejected_deleted
+    source_row    TEXT,               -- JSON：提交时源库实际整行（拒绝时留存）
+    submitted_at  TEXT NOT NULL,      -- 源库提交时间（复制而来）
+    mirrored_at   TEXT NOT NULL       -- 镜像落库时间（本地）
+);
+CREATE INDEX IF NOT EXISTS corrections_event_idx ON corrections(event_id);
 """
 
 LOG_KEEP = 100

@@ -1,7 +1,13 @@
-"""震例目录镜像采集网页：采集状态、震例查询、当前目录 CSV 下载、一致性校验。
+"""震例目录镜像采集网页：采集状态、震例查询、当前目录 CSV 下载、一致性校验、
+震级更正写回与回执确认。
 
 读一致性：每个请求只开一个只读事务，整次取数只读同一已提交状态；
-镜像未就绪（idle/loading/catchup）时一律 503，不供数。
+镜像未就绪（idle/loading/catchup）时查询/CSV/校验一律 503，不供数。
+
+更正写回：从就绪镜像打开单条震例（保留所见五字段）提交新震级；
+源库在一笔事务里核对当前整行、写更正、留回执；网页区分“源库已提交”
+与“镜像已采回”（凭镜像 corrections 表中的回执判定，不以震级相等或
+WAL 位置推断）。更正状态页在镜像重建期间仍可用：源端提交结果不受影响。
 """
 import hashlib
 import html
@@ -11,10 +17,24 @@ import urllib.parse
 from contextlib import asynccontextmanager
 
 import psycopg2
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 
 from canonical import canonical_line, norm_ts
+from correction import (
+    ConflictContent,
+    CorrectionRequest,
+    UnknownOutcome,
+    ValidationError,
+    build_expected,
+    fetch_record,
+    new_request_id,
+    norm_magnitude,
+    receipt_state,
+    record_from_row,
+    submit_correction,
+    validate_request_id,
+)
 from lsnutil import lsn_to_int
 from replicator import Replicator
 from store import Store
@@ -49,6 +69,11 @@ STATE_LABELS = {
     "catchup": "追平变更中",
     "done": "已就绪（供数中）",
 }
+OUTCOME_LABELS = {
+    "applied": "已写入源目录",
+    "rejected_mismatch": "已拒绝：源库当前整行与所见不符",
+    "rejected_deleted": "已拒绝：源库该编号已删除",
+}
 FILTER_KEYS = ("q", "t_from", "t_to", "min_mag", "lat_min", "lat_max", "lon_min", "lon_max")
 PAGE_SIZE = 50
 
@@ -76,6 +101,9 @@ input{padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:14px;mar
 label{font-size:13px;color:#555}
 form.inline{display:inline}
 .log td:first-child{white-space:nowrap;color:#666;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+nav{margin:0 auto;max-width:1080px;padding:10px 16px 0;font-size:14px}
+nav a{color:#1f6feb;text-decoration:none;margin-right:14px}
+nav a:hover{text-decoration:underline}
 h2{font-size:16px;margin:6px 0 12px}
 """
 
@@ -86,11 +114,15 @@ def esc(s):
 
 def page(title, body, refresh=False):
     meta = '<meta http-equiv="refresh" content="3">' if refresh else ""
+    nav = (
+        "<nav><a href='/'>采集状态</a><a href='/events'>查询震例</a>"
+        "<a href='/corrections'>更正与回执</a><a href='/events.csv'>目录 CSV</a></nav>"
+    )
     return (
         "<!doctype html><html lang='zh'><head><meta charset='utf-8'>"
         f"<title>{esc(title)}</title>{meta}<style>{CSS}</style></head><body>"
-        "<header><h1>震例目录镜像采集 <span>PostgreSQL 逻辑复制 · wal2json · SQLite 镜像</span></h1></header>"
-        f"<main>{body}</main></body></html>"
+        "<header><h1>震例目录镜像采集 <span>PostgreSQL 逻辑复制 · wal2json · SQLite 镜像 · 震级更正写回</span></h1></header>"
+        f"{nav}<main>{body}</main></body></html>"
     )
 
 
@@ -127,6 +159,7 @@ def collect_status():
         "target_lsn": meta.get("target_lsn") or "",
         "ready_at": meta.get("ready_at") or "",
         "mirror_rows": store.read("SELECT count(*) FROM events")[0][0],
+        "mirror_receipts": store.read("SELECT count(*) FROM corrections")[0][0],
         "crash_armed": replicator.crash_armed.is_set(),
         "source_ok": False,
         "source_rows": None,
@@ -180,6 +213,7 @@ def dashboard():
         ("是否供数", "是" if st["serving"] else "否（未就绪不供数）"),
         ("初始装载行数", st["loaded_rows"]),
         ("镜像当前行数", st["mirror_rows"]),
+        ("镜像已采更正回执数", st["mirror_receipts"]),
         ("源库当前行数（实时）", st["source_rows"] if st["source_ok"] else "源库不可用"),
         ("已应用源事务数", st["applied_txns"]),
         ("已应用行变更数", st["applied_changes"]),
@@ -245,6 +279,7 @@ def dashboard():
         actions.append("<a class='btn' href='/verify'>一致性校验</a>")
     else:
         actions.append("<span class='muted'>镜像就绪后开放查询、CSV 下载与一致性校验</span>")
+    actions.append("<a class='btn' href='/corrections'>更正与回执</a>")
 
     log_rows = "".join(
         f"<tr><td>{esc(ts)}</td><td>{esc(msg)}</td></tr>" for ts, msg in st["log"]
@@ -362,9 +397,10 @@ def events(request: Request):
 
     body_rows = "".join(
         f"<tr><td class='mono'>{esc(r[0])}</td><td class='mono'>{esc(r[1])}</td>"
-        f"<td>{r[2]:.3f}</td><td>{r[3]:.3f}</td><td>{r[4]:.1f}</td></tr>"
+        f"<td>{r[2]:.3f}</td><td>{r[3]:.3f}</td><td>{r[4]:.1f}</td>"
+        f"<td><a href='/correct/{urllib.parse.quote(r[0], safe='')}'>更正</a></td></tr>"
         for r in rows
-    ) or "<tr><td colspan='5' class='muted'>无匹配震例</td></tr>"
+    ) or "<tr><td colspan='6' class='muted'>无匹配震例</td></tr>"
 
     inputs = (
         f"<form method='get' action='/events'>"
@@ -395,7 +431,7 @@ def events(request: Request):
     body = (
         f"<div class='card'><h2>查询震例</h2>{inputs}</div>"
         f"<div class='card'><table><tr><th>震例号</th><th>UTC 发震时刻</th>"
-        f"<th>纬度</th><th>经度</th><th>震级</th></tr>{body_rows}</table>"
+        f"<th>纬度</th><th>经度</th><th>震级</th><th>操作</th></tr>{body_rows}</table>"
         f"<p style='margin-top:12px'>{''.join(pager)}</p></div>"
     )
     return page("查询震例", body)
@@ -433,6 +469,443 @@ def events_csv(request: Request):
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=quake_catalog.csv"},
     )
+
+
+# ---------------- 路由：震级更正写回与回执确认 ----------------
+
+def _expected_table(expected):
+    return (
+        "<table>"
+        f"<tr><th style='width:30%'>震例号</th><td class='mono'>{esc(expected['event_id'])}</td></tr>"
+        f"<tr><th>UTC 发震时刻</th><td class='mono'>{esc(expected['origin_time'])}</td></tr>"
+        f"<tr><th>纬度</th><td>{esc(expected['latitude'])}</td></tr>"
+        f"<tr><th>经度</th><td>{esc(expected['longitude'])}</td></tr>"
+        f"<tr><th>所见震级</th><td>{esc(expected['magnitude'])}</td></tr>"
+        "</table>"
+    )
+
+
+def _req_summary_table(req):
+    return (
+        f"<p>请求号 <span class='mono'>{esc(req.request_id)}</span> · "
+        f"新震级 <b>{esc(req.new_magnitude)}</b></p>"
+        f"{_expected_table(req.expected)}"
+    )
+
+
+def _record_table(rec):
+    """源库已存更正记录（含提交时源库实际整行，拒绝时备查）。"""
+    rows = [
+        ("请求号", f"<span class='mono'>{esc(rec['request_id'])}</span>"),
+        ("源库结论", esc(OUTCOME_LABELS.get(rec["outcome"], rec["outcome"]))),
+        ("更正后震级", esc(rec["new_magnitude"])),
+        ("提交时间（源库）", f"<span class='mono'>{esc(rec['submitted_at'])}</span>"),
+    ]
+    out = "<table>" + "".join(f"<tr><th style='width:30%'>{k}</th><td>{v}</td></tr>" for k, v in rows) + "</table>"
+    out += "<p class='muted'>提交时网页所见五字段：</p>" + _expected_table(rec["expected"])
+    if rec["source_row"]:
+        out += "<p class='muted'>提交时源库实际整行：</p>" + _expected_table(rec["source_row"])
+    return out
+
+
+def _hidden_fields(req):
+    e = req.expected
+    pairs = [
+        ("request_id", req.request_id),
+        ("event_id", e["event_id"]),
+        ("origin_time", e["origin_time"]),
+        ("latitude", e["latitude"]),
+        ("longitude", e["longitude"]),
+        ("magnitude", e["magnitude"]),
+        ("new_magnitude", req.new_magnitude),
+    ]
+    return "".join(f"<input type='hidden' name='{k}' value='{esc(v)}'>" for k, v in pairs)
+
+
+def _retry_form(req, label):
+    return (
+        f"<form method='post' action='/correct'>{_hidden_fields(req)}"
+        f"<button type='submit'>{esc(label)}</button></form>"
+    )
+
+
+@app.get("/correct/{event_id}", response_class=HTMLResponse)
+def correct_form(event_id: str):
+    """从就绪镜像打开单条震例：保留所见五字段，填写新震级。"""
+    if not serving():
+        return not_ready()
+    rows = store.read(
+        "SELECT event_id, origin_time, latitude, longitude, magnitude "
+        "FROM events WHERE event_id=?",
+        (event_id,),
+    )
+    if not rows:
+        body = (
+            "<div class='card'><h2>镜像中无此震例</h2>"
+            f"<p>震例号 <span class='mono'>{esc(event_id)}</span> 不在当前镜像中"
+            "（可能已被源库删除，或尚未采回）。</p>"
+            "<p><a class='btn' href='/events'>返回查询</a></p></div>"
+        )
+        return HTMLResponse(page("震例不存在", body), status_code=404)
+    r = rows[0]
+    rid = new_request_id()
+    lat, lon, mag = f"{r[2]:.3f}", f"{r[3]:.3f}", f"{r[4]:.1f}"
+    body = f"""
+<div class='card'><h2>震级更正 · 写回源目录</h2>
+<p class='muted'>以下五个字段取自就绪镜像的当前内容。提交时将在源库该编号的事务里
+逐字段核对当前整行：与所见不符或该编号已删除，源库拒绝本次更正（拒绝也会留回执）。</p>
+{_expected_table({"event_id": r[0], "origin_time": r[1], "latitude": lat, "longitude": lon, "magnitude": mag})}
+<form method='post' action='/correct' style='margin-top:12px'>
+  <input type='hidden' name='request_id' value='{rid}'>
+  <input type='hidden' name='event_id' value='{esc(r[0])}'>
+  <input type='hidden' name='origin_time' value='{esc(r[1])}'>
+  <input type='hidden' name='latitude' value='{lat}'>
+  <input type='hidden' name='longitude' value='{lon}'>
+  <input type='hidden' name='magnitude' value='{mag}'>
+  <p><label>新震级</label>
+     <input name='new_magnitude' value='{mag}' size='6' required>
+     <span class='muted'>一位小数，范围 -99.9 ~ 99.9</span></p>
+  <p>请求号 <span class='mono'>{rid}</span><br>
+     <span class='muted'>本次更正的固定请求号。提交后若需重试，请沿用同号同内容；
+     同号异内容将被拒绝。连接中断结果不明时，凭此号重试不会重复改写。</span></p>
+  <p><button type='submit'>提交更正</button>
+     <a class='btn' href='/events'>取消</a></p>
+</form></div>
+"""
+    return page("震级更正", body)
+
+
+@app.post("/correct", response_class=HTMLResponse)
+def correct_submit(
+    request_id: str = Form(...),
+    event_id: str = Form(...),
+    origin_time: str = Form(...),
+    latitude: str = Form(...),
+    longitude: str = Form(...),
+    magnitude: str = Form(...),
+    new_magnitude: str = Form(...),
+):
+    try:
+        req = CorrectionRequest(
+            request_id=validate_request_id(request_id),
+            expected=build_expected(event_id, origin_time, latitude, longitude, magnitude),
+            new_magnitude=norm_magnitude(new_magnitude),
+        )
+    except ValidationError as exc:
+        body = (
+            f"<div class='card'><h2>提交内容不合法</h2><p>{esc(exc)}</p>"
+            "<p><a class='btn' href='/events'>返回查询</a></p></div>"
+        )
+        return HTMLResponse(page("参数错误", body), status_code=400)
+
+    try:
+        rec = submit_correction(
+            lambda: psycopg2.connect(connect_timeout=5, **PG),
+            req,
+            integrity_errors=(psycopg2.IntegrityError,),
+        )
+    except UnknownOutcome as exc:
+        return _pending_page(req, exc)
+    except ConflictContent as exc:
+        return _conflict_page(req, exc.stored)
+    except Exception as exc:
+        return _not_submitted_page(req, exc)
+    return RedirectResponse(f"/correct/result/{rec['request_id']}", status_code=303)
+
+
+def _pending_page(req, exc):
+    """结果不明（连接中断）：源库可能已提交而响应丢失。凭原号原内容可安全重试。"""
+    body = f"""
+<div class='warn'><b>结果不明，待确认。</b><br>{esc(exc)}<br>
+源库可能已提交而响应丢失，也可能未提交。<b>请勿改动内容后重试</b> ——
+凭原请求号与原内容重试：已提交则返回原结果（不会重复改写），未提交则重新执行。</div>
+<div class='card'><h2>本次更正内容</h2>{_req_summary_table(req)}
+{_retry_form(req, "按原请求号与原内容重试")}
+<p class='muted'>本页表单在应用重启后仍可使用；也可稍后到
+<a href='/correct/result/{esc(req.request_id)}'>该请求号状态页</a>查看结果，或在
+<a href='/corrections'>更正与回执</a>页按请求号重试。</p></div>
+"""
+    return HTMLResponse(page("待确认", body))
+
+
+def _conflict_page(req, stored):
+    body = f"""
+<div class='err'><b>已拒绝：请求号 <span class='mono'>{esc(req.request_id)}</span>
+已被用于另一笔更正（同号异内容）。</b><br>
+该请求号的已存内容如下；若确需更正，请回到查询页重新发起（将生成新请求号）。</div>
+<div class='card'><h2>该请求号已存内容</h2>{_record_table(stored)}</div>
+<div class='card'><h2>本次被拒内容</h2>{_req_summary_table(req)}</div>
+<p><a class='btn' href='/correct/result/{esc(stored["request_id"])}'>查看该请求号状态</a>
+<a class='btn' href='/events'>返回查询</a></p>
+"""
+    return HTMLResponse(page("同号异内容已拒绝", body), status_code=409)
+
+
+def _not_submitted_page(req, exc):
+    body = f"""
+<div class='err'><b>提交失败：源库未受理本次更正（事务未提交，可安全重试）。</b><br>
+{esc(repr(exc))}</div>
+<div class='card'><h2>本次更正内容</h2>{_req_summary_table(req)}
+{_retry_form(req, "重试（同请求号同内容）")}</div>
+"""
+    return HTMLResponse(page("提交失败", body), status_code=502)
+
+
+@app.get("/correct/result/{request_id}", response_class=HTMLResponse)
+def correct_result(request_id: str):
+    """更正状态：区分「源库已提交」与「镜像已采回」。"""
+    try:
+        validate_request_id(request_id)
+    except ValidationError as exc:
+        body = f"<div class='card'><p>{esc(exc)}</p><p><a class='btn' href='/corrections'>返回更正与回执</a></p></div>"
+        return HTMLResponse(page("参数错误", body), status_code=400)
+
+    # 源库侧：提交结果（权威留痕；镜像重建期间也不受影响）
+    src_rec, src_err = None, None
+    try:
+        conn = psycopg2.connect(connect_timeout=3, **PG)
+        try:
+            with conn.cursor() as cur:
+                src_rec = fetch_record(cur, request_id)
+            conn.rollback()
+        finally:
+            conn.close()
+    except Exception as exc:
+        src_err = repr(exc)
+
+    # 镜像侧：回执与当前镜像值（同一只读事务，同一已提交状态）
+    ready = serving()
+    txn = store.read_txn()
+    try:
+        mrow = txn.execute(
+            "SELECT request_id, event_id, new_magnitude, expected, outcome, "
+            "source_row, submitted_at, mirrored_at FROM corrections WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+        event_id = (src_rec["event_id"] if src_rec else None) or (mrow[1] if mrow else None)
+        cur_mag, event_gone = None, False
+        if event_id:
+            ev = txn.execute(
+                "SELECT magnitude FROM events WHERE event_id=?", (event_id,)
+            ).fetchone()
+            if ev:
+                cur_mag = ev[0]
+            else:
+                event_gone = True
+    finally:
+        txn.close()
+
+    state = receipt_state(ready, mrow)
+
+    # —— 源库状态 ——
+    if src_err:
+        src_box = f"<div class='err'>源库不可用：{esc(src_err)}（稍后自动刷新重试）</div>"
+    elif src_rec is None:
+        src_box = (
+            "<div class='warn'>源库无此请求号的提交记录：该更正未提交（已回滚）或请求号有误。"
+            "若是提交中断后凭原号查询，可放心重新发起更正。</div>"
+        )
+    elif src_rec["outcome"] == "applied":
+        replay_note = "（本次为同号同内容重试，返回原结果）" if src_rec["replay"] else ""
+        src_box = (
+            f"<div class='ok'>✔ 源库已提交{replay_note}：震级已写回源目录，"
+            f"提交时间 <span class='mono'>{esc(src_rec['submitted_at'])}</span>。</div>"
+        )
+    else:
+        src_box = (
+            f"<div class='err'>✘ 源库已提交：{esc(OUTCOME_LABELS.get(src_rec['outcome'], src_rec['outcome']))}。"
+            "更正未写入，回执已留痕。</div>"
+        )
+
+    # —— 镜像采回状态 ——
+    if src_rec is None and mrow is None and not src_err:
+        receipt_box = ""   # 两侧都无记录：只显示上面的“源库无记录”提示
+    elif state == "collected":
+        if src_rec and src_rec["outcome"] != "applied":
+            what = "本次回执（拒绝记录）已在镜像落库"
+        else:
+            what = "本次更正与其回执已在镜像同笔落库"
+        receipt_box = (
+            f"<div class='ok'>✔ 镜像已采回：{what}"
+            f"（落库时间 <span class='mono'>{esc(mrow[7])}</span>）。"
+            "判定依据：镜像 corrections 表存在该请求号回执，而非震级相等或 WAL 位置。</div>"
+        )
+    elif state == "pending":
+        receipt_box = (
+            "<div class='warn'>… 采回中：回执尚未随逻辑复制到达镜像"
+            "（页面每 3 秒自动刷新）。</div>"
+        )
+    else:
+        receipt_box = (
+            "<div class='warn'>⏸ 镜像未就绪 / 重建中：源端提交结果已保留，"
+            "镜像就绪后将依据新镜像重新判定采回状态。</div>"
+        )
+
+    # —— 当前镜像值 ——
+    mirror_now = ""
+    if event_id:
+        if event_gone:
+            mirror_now = (
+                f"<p>震例 <span class='mono'>{esc(event_id)}</span> 当前不在镜像中"
+                "（可能已被源库删除）。</p>"
+            )
+        elif cur_mag is not None:
+            mirror_now = (
+                f"<p>当前镜像震级：<b>{cur_mag:.1f}</b>"
+                f"<span class='muted'>（震例 <span class='mono'>{esc(event_id)}</span>）</span></p>"
+            )
+            if src_rec and src_rec["outcome"] == "applied" and f"{cur_mag:.1f}" != src_rec["new_magnitude"]:
+                mirror_now += (
+                    f"<p class='muted'>当前镜像震级与本次更正值（{esc(src_rec['new_magnitude'])}）不同："
+                    "该震级可能已被后续测定覆盖；本次回执仍保留（见上）。</p>"
+                )
+
+    detail = f"<div class='card'><h2>提交内容</h2>{_record_table(src_rec)}</div>" if src_rec else ""
+    refresh = bool(src_err) or (src_rec is not None and state != "collected")
+    body = (
+        f"<div class='card'><h2>更正状态 · 请求号 <span class='mono'>{esc(request_id)}</span></h2>"
+        f"{src_box}{receipt_box}{mirror_now}</div>"
+        f"{detail}"
+        "<p><a class='btn' href='/corrections'>更正与回执列表</a>"
+        "<a class='btn' href='/events'>查询震例</a>"
+        f"<a class='btn' href='/correct/result/{esc(request_id)}'>刷新</a></p>"
+    )
+    return page("更正状态", body, refresh=refresh)
+
+
+@app.get("/correct/retry", response_class=HTMLResponse)
+def correct_retry(request: Request):
+    """按请求号重试：源库已提交的按原内容返回原结果；未提交的说明可安全重发。"""
+    rid = (request.query_params.get("request_id") or "").strip()
+    if not rid:
+        body = """
+<div class='card'><h2>按请求号重试 / 查询</h2>
+<form method='get' action='/correct/retry'>
+<label>请求号</label><input name='request_id' size='26' placeholder='RQ20261116-xxxxxxxx'>
+<button type='submit'>查询</button></form>
+<p class='muted'>提交时连接中断、结果不明的更正，可凭原请求号在此继续：
+源库已提交的按同号同内容返回原结果（不会重复改写）；
+源库无记录说明原提交未生效，可安全重新发起。</p></div>
+"""
+        return page("按请求号重试", body)
+    try:
+        validate_request_id(rid)
+    except ValidationError as exc:
+        body = f"<div class='card'><p>{esc(exc)}</p><p><a class='btn' href='/correct/retry'>返回</a></p></div>"
+        return HTMLResponse(page("参数错误", body), status_code=400)
+
+    try:
+        conn = psycopg2.connect(connect_timeout=3, **PG)
+        try:
+            with conn.cursor() as cur:
+                rec = fetch_record(cur, rid)
+            conn.rollback()
+        finally:
+            conn.close()
+    except Exception as exc:
+        body = (
+            f"<div class='err'>源库不可用：{esc(repr(exc))}</div>"
+            f"<p><a class='btn' href='/correct/retry?request_id={esc(rid)}'>重试</a></p>"
+        )
+        return HTMLResponse(page("源库不可用", body), status_code=502)
+
+    if rec is None:
+        body = f"""
+<div class='warn'>源库无请求号 <span class='mono'>{esc(rid)}</span> 的记录：
+原提交未生效（已回滚）。可回到查询页重新发起更正（将生成新请求号）。</div>
+<p><a class='btn' href='/events'>返回查询</a><a class='btn' href='/correct/retry'>换个请求号</a></p>
+"""
+        return page("无此请求号记录", body)
+
+    req = CorrectionRequest(rid, rec["expected"], rec["new_magnitude"])
+    body = f"""
+<div class='ok'>源库已有该请求号的提交记录（{esc(OUTCOME_LABELS.get(rec["outcome"], rec["outcome"]))}）。
+点击下方按钮将按<b>同号同内容</b>重新提交，返回原结果，不会重复改写。</div>
+<div class='card'><h2>已存内容</h2>{_record_table(rec)}
+{_retry_form(req, "按同号同内容重试")}</div>
+<p><a class='btn' href='/correct/result/{esc(rid)}'>查看该请求号状态</a></p>
+"""
+    return page("按请求号重试", body)
+
+
+@app.get("/corrections", response_class=HTMLResponse)
+def corrections_list():
+    """更正与回执总览：源库提交结果 + 镜像采回状态。镜像重建期间仍可用。"""
+    ready = serving()
+    src_rows, src_err = [], None
+    try:
+        conn = psycopg2.connect(connect_timeout=3, **PG)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT request_id, event_id, new_magnitude, expected, outcome, "
+                    "source_row, submitted_at FROM corrections "
+                    "ORDER BY submitted_at DESC LIMIT 50"
+                )
+                src_rows = [record_from_row(r) for r in cur.fetchall()]
+            conn.rollback()
+        finally:
+            conn.close()
+    except Exception as exc:
+        src_err = repr(exc)
+
+    # 镜像回执集合：同一只读事务，同一已提交状态
+    mirrored = {}
+    txn = store.read_txn()
+    try:
+        for r in txn.execute("SELECT request_id, mirrored_at FROM corrections"):
+            mirrored[r[0]] = r[1]
+    finally:
+        txn.close()
+
+    if src_err:
+        table_html = f"<div class='err'>源库不可用：{esc(src_err)}</div>"
+    elif not src_rows:
+        table_html = "<p class='muted'>源库暂无更正记录。</p>"
+    else:
+        trs = []
+        for rec in src_rows:
+            rid = rec["request_id"]
+            state = receipt_state(ready, (rid,) if rid in mirrored else None)
+            if state == "collected":
+                receipt = f"✔ 已采回<br><span class='muted mono'>{esc(mirrored[rid])}</span>"
+            elif state == "pending":
+                receipt = "… 采回中"
+            else:
+                receipt = "⏸ 镜像未就绪"
+            oc = OUTCOME_LABELS.get(rec["outcome"], rec["outcome"])
+            trs.append(
+                f"<tr><td class='mono'>{esc(rid)}</td>"
+                f"<td class='mono'>{esc(rec['event_id'])}</td>"
+                f"<td>{esc(rec['new_magnitude'])}</td>"
+                f"<td>{esc(oc)}</td>"
+                f"<td class='mono'>{esc(rec['submitted_at'])}</td>"
+                f"<td>{receipt}</td>"
+                f"<td><a href='/correct/result/{urllib.parse.quote(rid, safe='')}'>详情</a></td></tr>"
+            )
+        table_html = (
+            "<table><tr><th>请求号</th><th>震例号</th><th>新震级</th><th>源库结论</th>"
+            f"<th>提交时间</th><th>采集回执</th><th>详情</th></tr>{''.join(trs)}</table>"
+        )
+
+    state_note = "" if ready else (
+        "<div class='warn'>镜像当前未就绪 / 重建中：源端提交结果不受影响，"
+        "镜像就绪后将依据新镜像重新判定采回状态。</div>"
+    )
+    refresh = bool(src_err) or (not ready) or any(r["request_id"] not in mirrored for r in src_rows)
+    body = f"""
+{state_note}
+<div class='card'><h2>更正与回执（源库最近 50 笔）</h2>
+<p class='muted'>「已采回」依据镜像 corrections 表中的回执记录判定 —— 回执与更正同一源事务、
+在镜像同笔落库；不以震级相等或 WAL 总位置推断。</p>
+{table_html}</div>
+<div class='card'><h2>按请求号重试 / 查询</h2>
+<form method='get' action='/correct/retry'>
+<label>请求号</label><input name='request_id' size='26' placeholder='RQ20261116-xxxxxxxx'>
+<button type='submit'>查询</button></form>
+<p class='muted'>发起更正请先到 <a href='/events'>查询震例</a> 打开单条震例。</p></div>
+"""
+    return page("更正与回执", body, refresh=refresh)
 
 
 # ---------------- 路由：一致性校验 ----------------

@@ -23,3 +23,19 @@ SELECT 'EQH-' || lpad(g::text, 6, '0'),
 FROM generate_series(1, 30000) AS g;
 
 CREATE INDEX seismic_events_origin_time_idx ON seismic_events (origin_time);
+
+-- 震级更正回执：数据员从网页写回源目录的每一笔更正（含被拒绝的）都在此留痕。
+-- 该表是“固定请求号”幂等的根基：request_id 相同且内容相同的重试直接返回原记录，
+-- 不会重复改写；request_id 相同但内容不同的提交被拒绝。
+-- 回执与震级更正在同一源事务提交，经逻辑复制与更正同笔落入镜像，
+-- 采集端据此确认“已采回”（而不是凭震级相等或 WAL 位置推断）。
+CREATE TABLE corrections (
+    request_id    text PRIMARY KEY,         -- 固定请求号（幂等键），网页生成
+    event_id      text NOT NULL,            -- 目标震例号
+    new_magnitude numeric(3,1) NOT NULL,    -- 更正后震级
+    expected      text NOT NULL,            -- JSON：提交时网页所见的五个字段（整行核对基准）
+    outcome       text NOT NULL             -- applied=已写入；rejected_*=已拒绝（留痕）
+                  CHECK (outcome IN ('applied', 'rejected_mismatch', 'rejected_deleted')),
+    source_row    text,                     -- JSON：提交时源库实际整行（拒绝时留存备查）
+    submitted_at  timestamptz NOT NULL DEFAULT now()
+);

@@ -31,10 +31,14 @@ from store import Store, utcnow
 
 WAL2JSON_OPTIONS = {
     "format-version": "1",   # 一条消息 = 一笔源事务
-    "add-tables": "public.seismic_events",
+    "add-tables": "public.seismic_events,public.corrections",
     "include-xids": "1",
     "include-timestamp": "1",
 }
+
+# 镜像内容结构版本：v2 起镜像包含 corrections 更正回执表。
+# 已就绪的旧版镜像缺少回执数据，须重建后才能正确判定“已采回”。
+MIRROR_SCHEMA = "v2"
 
 
 class RebuildRequested(Exception):
@@ -85,7 +89,14 @@ class Replicator(threading.Thread):
                     self._reset_for_build()
                     self._build_and_stream()
                 elif state == "done":
-                    self._stream()
+                    if self.store.get_meta("mirror_schema", "") != MIRROR_SCHEMA:
+                        with self.store.write_txn() as cur:
+                            Store.set_meta(cur, "load_state", "loading")
+                            self.store.log(
+                                "镜像结构版本过旧（缺少更正回执表），重新建立镜像", cur
+                            )
+                    else:
+                        self._stream()
                 else:
                     with self.store.write_txn() as cur:
                         Store.set_meta(cur, "load_state", "idle")
@@ -103,8 +114,10 @@ class Replicator(threading.Thread):
     def _reset_for_build(self):
         with self.store.write_txn() as cur:
             cur.execute("DELETE FROM events")
+            cur.execute("DELETE FROM corrections")
             for key, value in (
                 ("load_state", "loading"),
+                ("mirror_schema", MIRROR_SCHEMA),
                 ("loaded_rows", "0"),
                 ("applied_txns", "0"),
                 ("applied_changes", "0"),
@@ -132,13 +145,14 @@ class Replicator(threading.Thread):
                     cur,
                 )
             t0 = time.monotonic()
-            loaded = self._initial_load(snapshot_name)
+            loaded, loaded_corr = self._initial_load(snapshot_name)
             target = self._current_wal_flush_lsn()
             with self.store.write_txn() as cur:
                 Store.set_meta(cur, "load_state", "catchup")
                 Store.set_meta(cur, "target_lsn", int_to_lsn(target))
                 self.store.log(
-                    f"初始装载完成：{loaded} 行，耗时 {time.monotonic() - t0:.1f}s；"
+                    f"初始装载完成：震例 {loaded} 行、更正回执 {loaded_corr} 行，"
+                    f"耗时 {time.monotonic() - t0:.1f}s；"
                     f"开始追平后续变更（目标 {int_to_lsn(target)}）",
                     cur,
                 )
@@ -151,7 +165,10 @@ class Replicator(threading.Thread):
                 pass
 
     def _initial_load(self, snapshot_name):
-        """在导出快照里全量读取源表；源库此时照常读写，互不影响。"""
+        """在导出快照里全量读取源表；源库此时照常读写，互不影响。
+
+        同一快照里装载震例与更正回执两张表，返回 (震例行数, 回执行数)。
+        """
         conn = psycopg2.connect(**self.pg)
         try:
             conn.set_session(isolation_level="REPEATABLE READ", readonly=True, autocommit=False)
@@ -183,8 +200,33 @@ class Replicator(threading.Thread):
                     Store.set_meta(cur, "loaded_rows", str(loaded))
                 if self.load_sleep_ms:
                     time.sleep(self.load_sleep_ms / 1000.0)
+            # 更正回执：与震例同一快照装载，重建后凭此重新判定“已采回”
+            scan_corr = conn.cursor(name="initial_load_corrections")
+            scan_corr.itersize = self.load_batch
+            scan_corr.execute(
+                "SELECT request_id, event_id, new_magnitude, expected, outcome, "
+                "source_row, submitted_at FROM corrections ORDER BY request_id"
+            )
+            loaded_corr = 0
+            while True:
+                batch = scan_corr.fetchmany(self.load_batch)
+                if not batch:
+                    break
+                self._drain_rebuild_cmd()
+                rows = [
+                    (r[0], r[1], float(r[2]), r[3], r[4], r[5], norm_ts(r[6]), utcnow())
+                    for r in batch
+                ]
+                with self.store.write_txn() as cur:
+                    cur.executemany(
+                        "INSERT INTO corrections(request_id, event_id, new_magnitude, "
+                        "expected, outcome, source_row, submitted_at, mirrored_at)"
+                        " VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                        rows,
+                    )
+                    loaded_corr += len(batch)
             conn.commit()
-            return loaded
+            return loaded, loaded_corr
         finally:
             conn.close()
 
